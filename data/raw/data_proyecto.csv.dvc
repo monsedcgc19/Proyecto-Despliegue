@@ -1,0 +1,5 @@
+outs:
+- md5: 05db85b0077fbf5eacab383fd36d64f4
+  size: 212506
+  hash: md5
+  path: data_proyecto.csv
