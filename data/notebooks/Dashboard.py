@@ -48,6 +48,22 @@ app.index_string = """
       background-color: #ffffff !important;   /* fondo blanco */  
       box-shadow: none !important;            /* sin sombra */
       }
+
+      /* Configuracion del Date Input */
+      .DateInput_input {
+      border: none !important;
+      box-shadow: none !important;
+      padding: 4px 6px !important;
+      height: 28px !important;
+      font-size: 14px !important;
+      background-color: #ffffff !important;
+      }
+
+      /* Hover */
+      .SingleDatePickerInput:hover {
+      border-color: #d0d7de !important;
+      background-color: #f8f9fa !important;
+      }
       
     </style>
   </head>
@@ -63,6 +79,32 @@ header = html.Div([
     html.H2("Planificación de Fondos", className="app-title"),
     html.Div(className="app-divider")
 ], className="pt-4")  
+
+# Filtro de fecha
+filters = dbc.Row([
+    dbc.Col(
+        dbc.CardBody([
+            dbc.Label([
+                "Fecha", 
+                html.I(className="bi bi-info-circle-fill text-muted", 
+                       id="tooltip-fecha", 
+                       style={"cursor": "pointer",
+                              "marginLeft":"4px"})],
+                  style={"marginRight":"8px"},
+    ),
+    dbc.Tooltip(
+    "Selecciona hasta qué fecha quieres hacer la predicción",
+    target="tooltip-fecha",
+    placement="right",   
+    style={"fontSize": "13px"}
+    ),
+        dcc.DatePickerSingle(
+            id="filtro-fecha",
+            date=dt.date.today(),
+            display_format="DD/MM/YYYY"
+        )
+    ]), md=3)
+], className="g-3")
 
 # Segundo componente: cards (row de 3 columnas)
 kpi_cards = dbc.Row([
@@ -111,6 +153,7 @@ table_card = dbc.Card(dbc.CardBody([
 
 app.layout = dbc.Container([
     header,
+    filters,
     kpi_cards,
     # agregarlo como un dbc row, con una sola columna 
     # className hace referencia a una clase de CSS que tiene estilos visuales predefinidos
