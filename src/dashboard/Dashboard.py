@@ -6,7 +6,7 @@ import dash_bootstrap_components as dbc
 import plotly.graph_objects as go
 import json, joblib
 import os
-
+import requests
 
 # App setup
 # -----------------------------
@@ -163,124 +163,7 @@ app.layout = dbc.Container([
     dbc.Row([dbc.Col(table_card, md=12)], className="mt-3 mb-5"),
 ], fluid=True)
 
-# --- helpers: mappings---
-DAY_MAP = {'Monday':1,'Tuesday':2,'Wednesday':3,'Thursday':4,'Friday':5,'Saturday':6,'Sunday':7}
-MONTH_MAP = {'January':1,'February':2,'March':3,'April':4,'May':5,'June':6,'July':7,'August':8,'September':9,'October':10,'November':11,'December':12}
-
-def featurize(df):
-    df = df.copy()
-    df['day_of_week'] = df['fecha'].dt.day_name().map(DAY_MAP)
-    df['month'] = df['fecha'].dt.month_name().map(MONTH_MAP)
-    df['year'] = df['fecha'].dt.year
-    df['is_fornight'] = df['fecha'].dt.day.isin([14,15]).astype(int)
-
-    df = df.sort_values(['producto','fecha']).reset_index(drop=True)
-
-    # Lags
-    df['lag_1']  = df.groupby('producto')['venta'].shift(1)
-    df['lag_7']  = df.groupby('producto')['venta'].shift(7)
-    df['lag_30'] = df.groupby('producto')['venta'].shift(30)
-    df['lag_60'] = df.groupby('producto')['venta'].shift(60)
-
-    # Diferencias
-    df['diff_1'] = df.groupby('producto')['venta'].diff(1)
-    df['diff_7'] = df.groupby('producto')['venta'].diff(7)
-
-    # Rolling features
-
-    df['rolling_mean_15'] = (df.groupby('producto')['venta']
-                               .transform(lambda x: x.rolling(15, min_periods=1).mean().shift(1)))
-    df['last_30_day_avg'] = (df.groupby('producto')['venta']
-                               .transform(lambda x: x.rolling(30, min_periods=1).mean().shift(1)))
-    df['rolling_std_15'] = (df.groupby('producto')['venta']
-                               .transform(lambda x: x.rolling(15, min_periods=1).std().shift(1)))
-    df['rolling_std_7'] = (df.groupby('producto')['venta']
-                         .transform(lambda x: x.rolling(7, min_periods=1).std().shift(1)))
-    df['rolling_max_15'] = (df.groupby('producto')['venta']
-                               .transform(lambda x: x.rolling(15, min_periods=1).max().shift(1)))
-    df['rolling_min_15'] = (df.groupby('producto')['venta']
-                               .transform(lambda x: x.rolling(15, min_periods=1).min().shift(1)))
-    
-    # Promedio dias iguales
-    def avg_last_4_same_day(series, dates):
-        out = []
-        for i in range(len(series)):
-            mask = dates.dt.day_name() == dates.iloc[i].day_name()
-            prev = series[mask].iloc[:i]
-            out.append(prev.iloc[-4:].mean() if len(prev)>=4 else (prev.mean() if len(prev)>0 else np.nan))
-        return out
-    
-    df['avg_last_4_same_day'] = avg_last_4_same_day(df['venta'], df['fecha'])
-
-    return df
-
-PRODUCTS = ["Producto 1","Producto 2","Producto 3","Producto 4"]
-
-# Traer los datos reales
-# -----------------------------
-def get_real_data(selected_date: dt.date) -> pd.DataFrame:
-
-    base_path = os.path.join(os.path.dirname(__file__), "..", "..", "data")
-    models_path = os.path.join(base_path, "models")
-    raw_path = os.path.join(base_path, "raw", "data_proyecto.csv")
-
-    productos = ["Producto 1", "Producto 2", "Producto 3", "Producto 4"]
-    resultados = []
-
-    for producto in productos:
-        suf = producto.lower().replace(" ", "")  # "Producto 1" -> "producto1"
-        model_path = os.path.join(models_path, f"rf_{suf}.pkl")
-        features_path = os.path.join(models_path, f"features_{suf}.json")
-
-        print(f"Cargando modelo: {model_path}")  # 👈 agrega esta línea
-
-        try:
-            model = joblib.load(model_path)
-        except Exception as e:
-            print(f"⚠️ Error cargando {model_path}: {e}")
-            raise
-
-        # carga modelo y features
-        model = joblib.load(model_path)
-        with open(features_path) as f:
-            feats = json.load(f)
-
-        # carga historico
-        hist = pd.read_csv(raw_path, parse_dates=["fecha"])
-        hist = hist[hist["producto"] == producto].sort_values("fecha").reset_index(drop=True)
-
-        # genera predicciones hasta la fecha seleccionada 
-        data = hist[hist["fecha"].dt.date <= selected_date].copy()
-        data = featurize(data)
-        X = data[feats].copy()
-        mask = X.notna().all(axis=1)
-        preds = pd.Series(np.nan, index=data.index)
-        preds[mask] = model.predict(X[mask])
-
-        resid = data.loc[mask, "venta"] - preds[mask]
-        sigma = resid.std() if resid.notna().any() else 0.0
-        ci = 1.96 * (sigma if sigma > 0 else 1.0)
-
-        out = pd.DataFrame({
-            "fecha": data["fecha"],
-            "producto": data["producto"],
-            "venta_real": data["venta"].values,
-            "venta_predicha": preds.values,
-        })
-        out["fondo_recomendado"] = np.where(out["venta_predicha"].notna(),
-                                            np.maximum(out["venta_predicha"]*0.95, 3e5),
-                                            np.nan)
-        out["ci_inferior"] = out["venta_predicha"] - ci
-        out["ci_superior"] = out["venta_predicha"] + ci
-        out["recurso_sobrante"] = np.where(out["venta_predicha"].notna(),
-                                           np.maximum(out["venta_predicha"] - out["venta_real"], 0),
-                                           np.nan)
-        resultados.append(out)
-
-    # --- une todo ---
-    df_final = pd.concat(resultados, ignore_index=True)
-    return df_final
-
+# --- helpers ---
 def format_currency(x):
     return "" if pd.isna(x) else f"${x:,.0f}".replace(",", ".")
 
@@ -305,67 +188,76 @@ def compute_kpis(df: pd.DataFrame, date: dt.date):
 
 def update_dashboard(date_str):
     date = pd.to_datetime(date_str).date()
-    df = get_real_data(date)
-
-    # update de los kpis
+    # :link: Llamada a la API
+    resp = requests.post(
+        "http://127.0.0.1:8000/predict",
+        json={"fecha_fin": str(date)}
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    df = pd.DataFrame(payload["predicciones"])
+    # Asegurar tipos
+    df["fecha"] = pd.to_datetime(df["fecha"])
+    # por si vienen None
+    for col in ["venta_real", "venta_predicha", "fondo_recomendado",
+                "recurso_sobrante"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    # KPIs
     fondo_total, rmse, var_pct = compute_kpis(df, date)
     k1 = format_currency(fondo_total)
     k2 = format_currency(rmse)
     k3 = f"{var_pct*100:.1f}%" if var_pct is not None else "—"
-
-    # update de la grafica de linea
-    series = df.groupby("fecha")[["venta_real","venta_predicha"]].sum().reset_index()
+    # Gráfica agregada
+    series = df.groupby("fecha")[["venta_real", "venta_predicha"]].sum().reset_index()
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=series["fecha"], 
-        y=series["venta_real"], 
-        name="Venta real", 
+        x=series["fecha"],
+        y=series["venta_real"],
+        name="Venta real",
         mode="lines+markers",
-        line=dict(color="#9287f9")
-        ))
+        line=dict(color="#9287F9")
+    ))
     fig.add_trace(go.Scatter(
-        x=series["fecha"], 
-        y=series["venta_predicha"], 
-        name="Venta predicha", 
+        x=series["fecha"],
+        y=series["venta_predicha"],
+        name="Venta predicha",
         mode="lines+markers",
-        line=dict(color="#a6c0ed")
-        ))
-    fig.update_layout(margin=dict(l=10, r=10, t=10, b=10),
-                      hovermode="x unified",
-                      legend_title_text="",
-                      height=300,
-                      font=dict(family="Segoe UI, Segoe UI Variable, -apple-system, system-ui, Arial, sans-serif"),
-                      plot_bgcolor="white",   # fondo del área de la gráfica
-                      paper_bgcolor="white",  # fondo general
-                      xaxis=dict(
-                          showgrid=False,      # sin líneas verticales
-                          zeroline=False,
-                          linecolor="#dee2e6",
-                          tickfont=dict(color="#495057")
-    ),
-    yaxis=dict(
-        showgrid=True,       # activa líneas horizontales
-        gridcolor="#e9ecef", # gris claro (puedes usar #dee2e6 o #f1f3f5 si quieres más suave)
-        zeroline=False,
-        linecolor="#dee2e6",
-        tickfont=dict(color="#495057")
+        line=dict(color="#A6C0ED")
+    ))
+    fig.update_layout(
+        margin=dict(l=10, r=10, t=10, b=10),
+        hovermode="x unified",
+        legend_title_text="",
+        height=300,
+        font=dict(family="Segoe UI, Segoe UI Variable, -apple-system, system-ui, Arial, sans-serif"),
+        plot_bgcolor="white",
+        paper_bgcolor="white",
+        xaxis=dict(
+            showgrid=False,
+            zeroline=False,
+            linecolor="#DEE2E6",
+            tickfont=dict(color="#495057")
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor="#E9ECEF",
+            zeroline=False,
+            linecolor="#DEE2E6",
+            tickfont=dict(color="#495057")
         )
     )
-
-    # update de la tabla
+    # Tabla por producto para la fecha seleccionada
     sumd = (df[df["fecha"].dt.date == date]
             .groupby("producto", as_index=False)
-            .agg(fondo_recomendado=("fondo_recomendado","sum"),
-                 recurso_sobrante=("recurso_sobrante","sum"),
-                 prediccion=("venta_predicha","sum"),
-                 venta_real=("venta_real","sum")))
-
-    for c in ["fondo_recomendado","recurso_sobrante","prediccion","venta_real"]:
+            .agg(fondo_recomendado=("fondo_recomendado", "sum"),
+                 recurso_sobrante=("recurso_sobrante", "sum"),
+                 prediccion=("venta_predicha", "sum"),
+                 venta_real=("venta_real", "sum")))
+    for c in ["fondo_recomendado", "recurso_sobrante", "prediccion", "venta_real"]:
         sumd[c] = sumd[c].map(format_currency)
-
     columns = [{"name": col.replace("_", " ").title(), "id": col} for col in sumd.columns]
     data = sumd.to_dict("records")
-
     return k1, k2, k3, fig, columns, data
 
 
