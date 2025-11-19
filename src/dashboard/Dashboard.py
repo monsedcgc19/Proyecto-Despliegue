@@ -17,6 +17,26 @@ app = Dash(
     title="Dashboard Provisionamiento",
 )
 
+def get_date_limits():
+    """Pregunta a la API por el histórico y calcula min_date y max_date."""
+    today = dt.date.today()
+    resp = requests.post(
+        "http://127.0.0.1:8000/predict",
+        json={"fecha_fin": str(today)}
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    df = pd.DataFrame(payload["predicciones"])
+    df["fecha"] = pd.to_datetime(df["fecha"])
+    # mínima fecha del dataset
+    min_date = df["fecha"].min().date()
+    # última fecha con venta_real no nula
+    last_real = df[df["venta_real"].notna()]["fecha"].max().date()
+    # máximo permitido: +3 semanas
+    max_date = last_real + dt.timedelta(weeks=3)
+    return min_date, max_date
+MIN_DATE, MAX_DATE = get_date_limits()
+
 # CSS global (fuente y estilos)
 app.index_string = """
 <!DOCTYPE html>
@@ -101,8 +121,10 @@ filters = dbc.Row([
     ),
         dcc.DatePickerSingle(
             id="filtro-fecha",
-            date=dt.date.today(),
-            display_format="DD/MM/YYYY"
+            date=MAX_DATE,
+            display_format="DD/MM/YYYY",
+            min_date_allowed=MIN_DATE,
+            max_date_allowed=MAX_DATE
         )
     ]), md=3)
 ], className="g-3")
@@ -168,11 +190,37 @@ def format_currency(x):
     return "" if pd.isna(x) else f"${x:,.0f}".replace(",", ".")
 
 def compute_kpis(df: pd.DataFrame, date: dt.date):
-    dfd = df[df["fecha"].dt.date == date]
-    fondo_total = dfd["fondo_recomendado"].sum()
-    rmse = np.sqrt(np.mean((dfd["venta_real"] - dfd["venta_predicha"])**2))
-    var_pct = np.random.uniform(-0.15, 0.15)  # solo decorativo
-    return fondo_total, rmse, var_pct
+    # Última fecha con venta_real disponible
+    mask_real = df["venta_real"].notna()
+    last_real_date = df.loc[mask_real, "fecha"].dt.date.max() if mask_real.any() else None
+    # KPI 1: ventas totales (reales o predichas según el caso)
+    if last_real_date is not None and date <= last_real_date:
+        # Caso histórico: usar solo ventas reales del día seleccionado
+        dfd = df[df["fecha"].dt.date == date]
+        kpi_ventas = dfd["venta_real"].sum()
+    elif last_real_date is not None:
+        # Caso futuro: suma de predicciones desde el día después de last_real_date hasta la fecha seleccionada
+        mask = (df["fecha"].dt.date > last_real_date) & (df["fecha"].dt.date <= date)
+        dfd = df[mask]
+        kpi_ventas = dfd["venta_predicha"].sum()
+    else:
+        # Backup raro: si no hay ventas reales en absoluto, usar solo predicciones hasta la fecha
+        mask = df["fecha"].dt.date <= date
+        dfd = df[mask]
+        kpi_ventas = dfd["venta_predicha"].sum()
+    # RMSE: solo donde hay venta_real y venta_predicha (hasta la fecha seleccionada)
+    dfd_rmse = df[
+        (df["fecha"].dt.date <= date)
+        & df["venta_real"].notna()
+        & df["venta_predicha"].notna()
+    ]
+    if not dfd_rmse.empty:
+        rmse = np.sqrt(np.mean((dfd_rmse["venta_real"] - dfd_rmse["venta_predicha"]) ** 2))
+    else:
+        rmse = np.nan
+    # Variación decorativa (la puedes cambiar luego si quieres algo más real)
+    var_pct = np.random.uniform(-0.15, 0.15)  # opcional / decorativo
+    return kpi_ventas, rmse, var_pct
 
 # Callbacks
 # -----------------------------
@@ -188,7 +236,8 @@ def compute_kpis(df: pd.DataFrame, date: dt.date):
 
 def update_dashboard(date_str):
     date = pd.to_datetime(date_str).date()
-    # :link: Llamada a la API
+
+    # Llamada a la API
     resp = requests.post(
         "http://127.0.0.1:8000/predict",
         json={"fecha_fin": str(date)}
@@ -196,20 +245,35 @@ def update_dashboard(date_str):
     resp.raise_for_status()
     payload = resp.json()
     df = pd.DataFrame(payload["predicciones"])
+
     # Asegurar tipos
     df["fecha"] = pd.to_datetime(df["fecha"])
+
     # por si vienen None
     for col in ["venta_real", "venta_predicha", "fondo_recomendado",
                 "recurso_sobrante"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
     # KPIs
-    fondo_total, rmse, var_pct = compute_kpis(df, date)
-    k1 = format_currency(fondo_total)
+    kpi_ventas, rmse, var_pct = compute_kpis(df, date)
+    k1 = format_currency(kpi_ventas)
     k2 = format_currency(rmse)
     k3 = f"{var_pct*100:.1f}%" if var_pct is not None else "—"
+
     # Gráfica agregada
     series = df.groupby("fecha")[["venta_real", "venta_predicha"]].sum().reset_index()
+
+    # Última fecha real
+    mask_real = df["venta_real"].notna()
+    last_real_date = df.loc[mask_real, "fecha"].max().date() if mask_real.any() else None
+    if last_real_date:
+        # Donde la fecha es > last_real_date → venta_real debe ser NaN
+        series["venta_real"] = series.apply(
+            lambda row: row["venta_real"] if row["fecha"].date() <= last_real_date else np.nan,
+            axis=1
+        )
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=series["fecha"],
@@ -247,13 +311,29 @@ def update_dashboard(date_str):
             tickfont=dict(color="#495057")
         )
     )
-    # Tabla por producto para la fecha seleccionada
-    sumd = (df[df["fecha"].dt.date == date]
+    # Tabla por producto con la misma lógica que el KPI
+    mask_real = df["venta_real"].notna()
+    last_real_date = df.loc[mask_real, "fecha"].dt.date.max() if mask_real.any() else None
+    if last_real_date is not None and date <= last_real_date:
+        # Caso histórico: solo ese día
+        dft = df[df["fecha"].dt.date == date]
+    elif last_real_date is not None:
+        # Caso futuro: rango desde el día después de last_real_date hasta la fecha seleccionada
+        mask = (df["fecha"].dt.date > last_real_date) & (df["fecha"].dt.date <= date)
+        dft = df[mask]
+    else:
+        # Backup: si no hay ventas reales, usamos todo hasta la fecha
+        mask = df["fecha"].dt.date <= date
+        dft = df[mask]
+    sumd = (dft
             .groupby("producto", as_index=False)
-            .agg(fondo_recomendado=("fondo_recomendado", "sum"),
-                 recurso_sobrante=("recurso_sobrante", "sum"),
-                 prediccion=("venta_predicha", "sum"),
-                 venta_real=("venta_real", "sum")))
+            .agg(
+                fondo_recomendado=("fondo_recomendado", "sum"),
+                recurso_sobrante=("recurso_sobrante", "sum"),
+                prediccion=("venta_predicha", "sum"),
+                venta_real=("venta_real", "sum")
+            ))
+
     for c in ["fondo_recomendado", "recurso_sobrante", "prediccion", "venta_real"]:
         sumd[c] = sumd[c].map(format_currency)
     columns = [{"name": col.replace("_", " ").title(), "id": col} for col in sumd.columns]
