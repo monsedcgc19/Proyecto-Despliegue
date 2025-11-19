@@ -53,15 +53,21 @@ def featurize(df: pd.DataFrame) -> pd.DataFrame:
     # -----------------------------------------
     # Lags
     # -----------------------------------------
-    df['lag_1'] = df.groupby('producto')['venta'].shift(1)      # ← agregado
-    df['lag_7'] = df.groupby('producto')['venta'].shift(7)
-    df['lag_30'] = df.groupby('producto')['venta'].shift(30)
-    df['lag_60'] = df.groupby('producto')['venta'].shift(60)
+    grupo = df.groupby('producto')['venta']
+    df['lag_1'] = grupo.shift(1)
+    df['lag_2'] = grupo.shift(2)          # ← nuevo
+    df['lag_7'] = grupo.shift(7)
+    df['lag_8'] = grupo.shift(8)          # ← nuevo
+    df['lag_30'] = grupo.shift(30)
+    df['lag_60'] = grupo.shift(60)
     # -----------------------------------------
-    # Diferencias (diff)
+    # Diferencias (diff) sin usar la venta actual
     # -----------------------------------------
-    df['diff_1'] = df.groupby('producto')['venta'].diff(1)      # ← agregado
-    df['diff_7'] = df.groupby('producto')['venta'].diff(7)      # ← agregado
+    # diff_1: diferencia entre el penúltimo y el antepenúltimo valor
+    df['diff_1'] = df['lag_1'] - df['lag_2']
+    # diff_7: cambio en 7 días usando solo lags
+    # (venta t-1 vs venta t-8)
+    df['diff_7'] = df['lag_1'] - df['lag_8']
     # -----------------------------------------
     # Promedios móviles y rolling stats
     # -----------------------------------------
@@ -123,43 +129,128 @@ def load_model_and_features(producto: str):
     with open(feats_path) as f:
         feats = json.load(f)
     return model, feats
+
 def get_real_data(fecha_fin: dt.date) -> pd.DataFrame:
-    """Equivalente a tu get_real_data, pero para los 4 productos."""
-    hist = load_hist_data()
+    """
+    Devuelve ventas reales + predicciones para los 4 productos,
+    incluyendo predicción hacia adelante hasta fecha_fin (máx. +3 semanas).
+    """
+    hist = load_hist_data()  # columnas esperadas: fecha, producto, venta
+    hist = hist.sort_values(["producto", "fecha"]).reset_index(drop=True)
+    # Fecha máxima real en el histórico (global)
+    last_real_global = hist["fecha"].max().date()
+    max_allowed_date = last_real_global + dt.timedelta(weeks=3)
+    # Limitar la fecha de fin a máximo +3 semanas
+    if fecha_fin > max_allowed_date:
+        fecha_fin = max_allowed_date
     resultados = []
     for producto in PRODUCTOS:
-        model, feats = load_model_and_features(producto)
-        data_p = hist[hist['producto'] == producto].copy()
-        data_p = data_p[data_p['fecha'].dt.date <= fecha_fin]
+        # Histórico solo de ese producto
+        data_p = hist[hist["producto"] == producto].copy()
         if data_p.empty:
             continue
-        data_p = featurize(data_p)
-        X = data_p[feats].copy()
-        mask = X.notna().all(axis=1)
-        preds = pd.Series(np.nan, index=data_p.index)
-        preds[mask] = model.predict(X[mask])
-        resid = data_p.loc[mask, 'venta'] - preds[mask]
+        # Última fecha real de ese producto
+        last_real_prod = data_p["fecha"].max().date()
+        # Fecha objetivo (ya limitada globalmente)
+        fecha_objetivo = fecha_fin
+        # ---------------------------
+        # 1) Parte histórica (<= min(fecha_objetivo, last_real_prod))
+        # ---------------------------
+        fecha_corte_hist = min(fecha_objetivo, last_real_prod)
+        data_hist = data_p[data_p["fecha"].dt.date <= fecha_corte_hist].copy()
+        if data_hist.empty:
+            continue
+        # Features históricas
+        data_hist_feat = featurize(data_hist)
+        # Modelo y lista de features
+        model, feats = load_model_and_features(producto)
+        X_hist = data_hist_feat[feats].copy()
+        mask_hist = X_hist.notna().all(axis=1)
+        preds_hist = pd.Series(np.nan, index=data_hist_feat.index)
+        preds_hist[mask_hist] = model.predict(X_hist[mask_hist])
+        # Desviación estándar de residuos para construir intervalo de confianza
+        resid = data_hist_feat.loc[mask_hist, "venta"] - preds_hist[mask_hist]
         sigma = resid.std() if resid.notna().any() else 0.0
         ci = 1.96 * (sigma if sigma > 0 else 1.0)
-        out = pd.DataFrame({
-            "fecha": data_p["fecha"],
-            "producto": data_p["producto"],
-            "venta_real": data_p["venta"].values,
-            "venta_predicha": preds.values,
+        out_hist = pd.DataFrame({
+            "fecha": data_hist_feat["fecha"].values,
+            "producto": data_hist_feat["producto"].values,
+            "venta_real": data_hist_feat["venta"].values,
+            "venta_predicha": preds_hist.values,
         })
-        out["fondo_recomendado"] = np.where(out["venta_predicha"].notna(),
-                                            np.maximum(out["venta_predicha"]*0.95, 3e5),
-                                            np.nan)
-        out["ci_inferior"] = out["venta_predicha"] - ci
-        out["ci_superior"] = out["venta_predicha"] + ci
-        out["recurso_sobrante"] = np.where(out["venta_predicha"].notna(),
-                                           np.maximum(out["venta_predicha"] - out["venta_real"], 0),
-                                           np.nan)
-        resultados.append(out)
+        # ---------------------------
+        # 2) Parte futura (> last_real_prod hasta fecha_objetivo)
+        #    Predicción recursiva día a día
+        # ---------------------------
+        future_rows = []
+        if fecha_objetivo > last_real_prod:
+            start_future = pd.to_datetime(last_real_prod) + dt.timedelta(days=1)
+            end_future = pd.to_datetime(fecha_objetivo)
+            future_dates = pd.date_range(start_future, end_future, freq="D")
+            # Base para features futuras: histórico con columna 'venta'
+            base_for_feat = data_hist[["fecha", "producto", "venta"]].copy()
+            for f_date in future_dates:
+                # Agregar fila vacía (venta desconocida)
+                new_row = pd.DataFrame({
+                    "fecha": [f_date],
+                    "producto": [producto],
+                    "venta": [np.nan],
+                })
+                base_for_feat = pd.concat([base_for_feat, new_row], ignore_index=True)
+                # Recalcular features con histórico + fila nueva
+                feat_all = featurize(base_for_feat.copy())
+                row_feat = feat_all[
+                    (feat_all["producto"] == producto) &
+                    (feat_all["fecha"] == f_date)
+                ]
+                if row_feat.empty:
+                    pred_val = np.nan
+                else:
+                    X_f = row_feat[feats]
+                    mask_f = X_f.notna().all(axis=1)
+                    if mask_f.iloc[0]:
+                        pred_val = float(model.predict(X_f)[0])
+                    else:
+                        pred_val = np.nan
+                # Actualizar la serie de 'venta' con la predicción
+                base_for_feat.loc[
+                    (base_for_feat["producto"] == producto) &
+                    (base_for_feat["fecha"] == f_date),
+                    "venta"
+                ] = pred_val
+                # Guardar fila futura para salida de la API
+                future_rows.append({
+                    "fecha": f_date,
+                    "producto": producto,
+                    "venta_real": np.nan,
+                    "venta_predicha": pred_val,
+                })
+        if future_rows:
+            out_future = pd.DataFrame(future_rows)
+            out_prod = pd.concat([out_hist, out_future], ignore_index=True)
+        else:
+            out_prod = out_hist
+        # ---------------------------
+        # 3) Columnas derivadas (igual que antes)
+        # ---------------------------
+        out_prod["fondo_recomendado"] = np.where(
+            out_prod["venta_predicha"].notna(),
+            np.maximum(out_prod["venta_predicha"] * 0.95, 3e5),
+            np.nan,
+        )
+        out_prod["ci_inferior"] = out_prod["venta_predicha"] - ci
+        out_prod["ci_superior"] = out_prod["venta_predicha"] + ci
+        out_prod["recurso_sobrante"] = np.where(
+            out_prod["venta_predicha"].notna() & out_prod["venta_real"].notna(),
+            np.maximum(out_prod["venta_predicha"] - out_prod["venta_real"], 0),
+            np.nan,
+        )
+        resultados.append(out_prod)
+    # Si no hay datos, devolver df vacío con las columnas esperadas
     if not resultados:
         return pd.DataFrame(columns=[
-            "fecha","producto","venta_real","venta_predicha",
-            "fondo_recomendado","ci_inferior","ci_superior","recurso_sobrante"
+            "fecha", "producto", "venta_real", "venta_predicha",
+            "fondo_recomendado", "ci_inferior", "ci_superior", "recurso_sobrante",
         ])
     df_final = pd.concat(resultados, ignore_index=True).sort_values("fecha")
     return df_final
